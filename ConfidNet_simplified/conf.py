@@ -105,6 +105,13 @@ class CustomConfidNet(nn.Module):
                 [self._feature_extractor_modules, self._classifier_head_modules, self._confidence_head_modules],
                 False
             )
+        elif phase == "mc_dropout_eval":
+            self.eval() # Set all modules to eval mode (disables batch norm updates, no gradients)
+            # Explicitly set dropout layers to train mode to activate dropout during inference
+            self.dropout_feat_ext.train()
+            self.dropout_fc_feat_ext.train()
+            # Parameters will not have requires_grad=True, as we are still in inference context
+        
         else:
             raise ValueError(f"Unknown training phase: {phase}")
 
@@ -149,8 +156,14 @@ def train_confidnet_epoch(model, device, train_loader, optimizer, epoch, log_int
                   f"({100. * batch_idx / len(train_loader):.0f}%)]\tConfidLoss: {loss.item():.6f}")
 
 # --- 3. Evaluation Logic ---
-def evaluate_model(model, device, test_loader):
-    model.configure_train_phase("eval")
+def evaluate_model(model, device, test_loader, use_mc_dropout=False, num_mc_samples=10):
+    if use_mc_dropout:
+        model.configure_train_phase("mc_dropout_eval")
+        print(f"\n--- Evaluation with MC Dropout ({num_mc_samples} samples) ---")
+    else:
+        model.configure_train_phase("eval")
+        print("\n--- Standard Evaluation ---")
+
     correct_cls = 0
     total = 0
     all_targets = []
@@ -162,13 +175,27 @@ def evaluate_model(model, device, test_loader):
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(test_loader):
             data, target = data.to(device), target.to(device)
-            logits, confidence_scores = model(data)
+
+            if use_mc_dropout:
+                mc_logits_sum = torch.zeros(data.size(0), model.num_classes).to(device)
+                mc_confidence_sum = torch.zeros(data.size(0), 1).to(device)
+                
+                for _ in range(num_mc_samples):
+                    logits_sample, confidence_scores_sample = model(data)
+                    mc_logits_sum += logits_sample
+                    mc_confidence_sum += confidence_scores_sample
+                
+                logits = mc_logits_sum / num_mc_samples
+                confidence_scores = mc_confidence_sum / num_mc_samples
+            else:
+                logits, confidence_scores = model(data)
+
             _, predicted_labels = torch.max(logits.data, 1)
 
             total += target.size(0)
             correct_cls += (predicted_labels == target).sum().item()
 
-            mcp_scores = F.softmax(logits, dim=1).max(dim=1)[0] # Maximum Class Probability (MCP) [cite: 3, 15]
+            mcp_scores = F.softmax(logits, dim=1).max(dim=1)[0] # Maximum Class Probability (MCP)
 
             all_targets.extend(target.cpu().numpy())
             all_predicted_labels.extend(predicted_labels.cpu().numpy())
@@ -189,7 +216,7 @@ def evaluate_model(model, device, test_loader):
 
 # --- 4. Main Execution ---
 def main():
-    parser = argparse.ArgumentParser(description="ConfidNet Training for Custom PNG Dataset")
+    parser = argparse.ArgumentParser(description="ConfidNet Training for PNG Dataset")
     parser.add_argument('--data-path', type=str, default='./processed_mnist',
                         help='path to the root dataset directory (containing train/test subfolders)')
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
@@ -201,13 +228,13 @@ def main():
     parser.add_argument('--confidnet-epochs', type=int, default=3, metavar='N',
                         help='number of epochs to train ConfidNet head (default: 3)')
     parser.add_argument('--confidnet-finetune-epochs', type=int, default=2, metavar='N',
-                        help='number of epochs to fine-tune ConvNet with ConfidNet (default: 2, set to 0 to disable) [cite: 79]')
+                        help='number of epochs to fine-tune ConvNet with ConfidNet (default: 2, set to 0 to disable)')
     parser.add_argument('--lr-classifier', type=float, default=0.01, metavar='LR',
                         help='learning rate for classifier (default: 0.01)')
     parser.add_argument('--lr-confidnet', type=float, default=0.001, metavar='LR',
                         help='learning rate for ConfidNet head (default: 0.001)')
     parser.add_argument('--lr-confidnet-finetune', type=float, default=0.0001, metavar='LR',
-                        help='learning rate for ConfidNet ConvNet fine-tuning (default: 0.0001, typically smaller) [cite: 81]')
+                        help='learning rate for ConfidNet ConvNet fine-tuning (default: 0.0001, typically smaller)')
     parser.add_argument('--momentum-classifier', type=float, default=0.5, metavar='M',
                         help='SGD momentum for classifier (default: 0.5)')
     parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -219,6 +246,10 @@ def main():
     parser.add_argument('--num-classes', type=int, default=10, help='Number of classes in the dataset')
     parser.add_argument('--input-channels', type=int, default=1,
                         help='Number of input channels (1 for grayscale, 3 for RGB)')
+    parser.add_argument('--mc-dropout', action='store_true', default=False,
+                        help='enable Monte Carlo Dropout during evaluation')
+    parser.add_argument('--num-mc-samples', type=int, default=10,
+                        help='number of Monte Carlo samples for dropout during evaluation (default: 10)')
 
 
     args = parser.parse_args()
@@ -227,14 +258,9 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if use_cuda else "cpu")
     print(f"Using device: {device}")
-    # For 1-channel (grayscale) images:
+    
     dataset_mean = (0.1307,)
     dataset_std = (0.3081,)
-    # if args.input_channels == 3:
-    #     print("WARNING: Using placeholder 3-channel mean/std. Please calculate for your dataset.")
-    #     dataset_mean = (0.5, 0.5, 0.5) # Placeholder
-    #     dataset_std = (0.5, 0.5, 0.5)  # Placeholder
-
 
     transform_list = []
     if args.input_channels == 1:
@@ -263,9 +289,8 @@ def main():
     if use_cuda:
         cuda_kwargs = {'num_workers': 1, 'pin_memory': True, 'shuffle': True}
         train_loader_kwargs.update(cuda_kwargs)
-        # Shuffle is typically False for test/validation
         test_loader_kwargs.update({'num_workers': 1, 'pin_memory': True, 'shuffle': False})
-    else: # ensure shuffle is True for train loader even without CUDA
+    else: 
          train_loader_kwargs.update({'shuffle': True})
          test_loader_kwargs.update({'shuffle': False})
 
@@ -277,35 +302,39 @@ def main():
 
     # --- Phase 1: Train Classifier ---
     print("--- Training Classifier ---")
-    # Ensure only feature extractor and classifier parameters are optimized initially
     model.configure_train_phase("classification_train")
     optimizer_cls = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()),
                               lr=args.lr_classifier, momentum=args.momentum_classifier)
     for epoch in range(1, args.classifier_epochs + 1):
         train_classifier_epoch(model, device, train_loader, optimizer_cls, epoch, args.log_interval)
-    evaluate_model(model, device, test_loader) # Evaluate after classifier training
+    
+    # Evaluate after classifier training, potentially with MC Dropout
+    evaluate_model(model, device, test_loader, use_mc_dropout=args.mc_dropout, num_mc_samples=args.num_mc_samples) 
 
     # --- Phase 2: Train ConfidNet Head ---
-    # (ConvNet encoder fixed) [cite: 78]
     print("\n--- Training ConfidNet Head (ConvNet Frozen) ---")
     model.configure_train_phase("confidence_train")
     optimizer_conf = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_confidnet)
     for epoch in range(1, args.confidnet_epochs + 1):
         train_confidnet_epoch(model, device, train_loader, optimizer_conf, epoch, args.log_interval, fine_tune_convnet=False)
-    evaluate_model(model, device, test_loader)
+    
+    # Evaluate after ConfidNet head training, potentially with MC Dropout
+    evaluate_model(model, device, test_loader, use_mc_dropout=args.mc_dropout, num_mc_samples=args.num_mc_samples)
 
     if args.confidnet_finetune_epochs > 0:
         print("\n--- Fine-tuning ConvNet with ConfidNet ---")
-        model.configure_train_phase("confidence_finetune_convnet") # This should handle dropout deactivation internally
+        model.configure_train_phase("confidence_finetune_convnet")
         optimizer_finetune = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr_confidnet_finetune)
         for epoch in range(1, args.confidnet_finetune_epochs + 1):
             train_confidnet_epoch(model, device, train_loader, optimizer_finetune, epoch, args.log_interval, fine_tune_convnet=True)
-        evaluate_model(model, device, test_loader)
+        
+        # Evaluate after fine-tuning, potentially with MC Dropout
+        evaluate_model(model, device, test_loader, use_mc_dropout=args.mc_dropout, num_mc_samples=args.num_mc_samples)
 
 
     # --- Final Evaluation ---
     print("\n--- Final Evaluation After All Training Phases ---")
-    final_accuracy = evaluate_model(model, device, test_loader)
+    final_accuracy = evaluate_model(model, device, test_loader, use_mc_dropout=args.mc_dropout, num_mc_samples=args.num_mc_samples)
     print(f"Final accuracy: {final_accuracy:.2f}%")
 
 if __name__ == '__main__':
